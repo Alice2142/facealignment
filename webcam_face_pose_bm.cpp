@@ -49,6 +49,7 @@
 #include <dlib/image_processing/render_face_detections.h>
 #include <dlib/image_processing.h>
 #include <dlib/image_transforms.h>
+#include <dlib/filtering/kalman_filter.h>
 
 using namespace libconfig;
 using namespace std;

@@ -1,0 +1,6 @@
+/home/lin/Documents/faceAlignment/dlibFA-multithread/release/CMakeFiles/edit_cache.dir
+/home/lin/Documents/faceAlignment/dlibFA-multithread/release/CMakeFiles/rebuild_cache.dir
+/home/lin/Documents/faceAlignment/dlibFA-multithread/release/CMakeFiles/webcam_face.dir
+/home/lin/Documents/faceAlignment/dlibFA-multithread/release/dlib_build/CMakeFiles/edit_cache.dir
+/home/lin/Documents/faceAlignment/dlibFA-multithread/release/dlib_build/CMakeFiles/rebuild_cache.dir
+/home/lin/Documents/faceAlignment/dlibFA-multithread/release/dlib_build/CMakeFiles/dlib.dir

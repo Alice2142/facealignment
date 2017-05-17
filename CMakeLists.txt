@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 2.8)
+project( webcam_face)
+include(/home/lin/ml/dlib/dlib/cmake)
+find_package( OpenCV REQUIRED)
+add_executable( webcam_face webcam_face_pose_bm.cpp)
+target_link_libraries( webcam_face ${OpenCV_LIBS} dlib::dlib /usr/local/lib/libconfig++.so)

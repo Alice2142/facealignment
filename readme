@@ -1,0 +1,8 @@
+Relevant libraries:
+libconfig
+opencv
+dlib
+thread
+
+Description:
+multithread face detection and alignment without tracking

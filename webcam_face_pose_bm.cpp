@@ -50,6 +50,7 @@
 #include <dlib/image_processing.h>
 #include <dlib/image_transforms.h>
 #include <dlib/filtering/kalman_filter.h>
+#include "kalman_init.h"
 
 using namespace libconfig;
 using namespace std;
@@ -60,18 +61,19 @@ class DriverAnalyzer: public multithreaded_object
 public:
     DriverAnalyzer(
 	int videoId_, int apiId_, string cascadeName_, double scaleFactor_, int skipFrames_, double downScale_, 
-        int lag_, float varSigmaThresh_, float dampingFactor_,
+        int lag_, float varSigmaThresh_, float dampingFactor_, int interval_, 
 	frontal_face_detector *detector, 
-	shape_predictor *estimator
+	shape_predictor *estimator,
+	kalman_filter<4,  2> *kf
     ): API_ID(apiId_), CASCADE_NAME(cascadeName_), SCALE_FACTOR(scaleFactor_), SKIP_FRAMES(skipFrames_), DOWN_SCALE(downScale_),
-    LAG(lag_), VAR_SIGMA_THRESH(varSigmaThresh_), DAMPING_FACTOR(dampingFactor_)
+    LAG(lag_), VAR_SIGMA_THRESH(varSigmaThresh_), DAMPING_FACTOR(dampingFactor_), INTERVAL(interval_)
     {
         // Initialize video stream:
 	videoStream = new cv::VideoCapture(videoId_);
         // Initialize face detector & landmarks estimator:
 	this->detector = detector;
 	this->estimator = estimator;
-
+    this->kf = kf;
         if (NULL == videoStream || !videoStream->isOpened())
         {
             cerr << "[VideoProducer]: Unable to connect to video" << videoId_ << endl;
@@ -186,7 +188,7 @@ private:
                     avgFiltered = sumFiltered / lag;
                     varFiltered = (squareSumFiltered - sumFiltered*sumFiltered/lag) / (lag-1);  
                 }
-            } 
+            }
             else 
             {
                 float diff = avgFiltered - newVal; //tl
@@ -233,6 +235,7 @@ private:
     // Models:
     frontal_face_detector *detector = NULL;
     shape_predictor *estimator = NULL;
+    kalman_filter<4, 2> *kf = NULL;
     // Landmarks:
     const int LANDMARK_START = 36;
     const int LANDMARK_END = 48;
@@ -243,6 +246,9 @@ private:
     int LAG;
     float VAR_SIGMA_THRESH, DAMPING_FACTOR;
 
+    // tracking intervals
+    int INTERVAL;
+    
     // Initialize message queues:
     ConcurrentQueue<cv::Mat> processorQueue;
     ConcurrentQueue<FacialInfo> monitorQueue;
@@ -260,20 +266,20 @@ private:
         {
             videoStream->read(frame);
 
-	    if (!(++frameIdx % SKIP_FRAMES)) {
-	    	cv::resize(frame, frame, cv::Size(), 1.0 / DOWN_SCALE, 1.0 / DOWN_SCALE, cv::INTER_AREA);
-            frameIdx = 0;
-	    	processorQueue.add(frame.clone());
-	    }
+	        if ( (SKIP_FRAMES == 0) || !(++frameIdx % SKIP_FRAMES)) {
+	        	cv::resize(frame, frame, cv::Size(), 1.0 / DOWN_SCALE, 1.0 / DOWN_SCALE, cv::INTER_AREA);
+                frameIdx = 0;
+	        	processorQueue.add(frame.clone());
+	        }
         }
     }
 
     void detectFace()
     {
-	while (processorQueue.size() != 0)
+	    while (processorQueue.size() != 0)
             processorQueue.remove();
 	
-	        // Load opencv fd model.
+        // Load opencv fd model.
         cv::CascadeClassifier ocvCascade;
         std::vector<cv::Rect> ocvRects;
         if (API_ID == 1)
@@ -286,8 +292,16 @@ private:
         double time = 0;
         string imNamePath = "../frames/img_";
         string imName;
+        
+		matrix<double, 2, 1> z;
+		matrix<double, 4, 1> x;
+
+        std::vector<rectangle> faces;
+        std::vector<rectangle> facesA;
+        
         while (should_stop() == false)
         {
+            faces.clear();
         	if (ind == LAG * 2)
         	{
         		t_start = clock();
@@ -310,41 +324,88 @@ private:
         		imName += ".jpg";
         		imwrite(imName, frame);
         	}
-        	ind++;
         	
             // Detect faces 
-            std::vector<rectangle> faces;
-            if (API_ID == 0)
+            if ( INTERVAL == 0 || ind % INTERVAL == 0)
             {
-	            clock_t td = clock();
-            	faces = (*detector)(image);
-	            cout << "Only detection: " << (double) (clock() - td) * 1000/ CLOCKS_PER_SEC << endl;
+                if (API_ID == 0)
+                {
+	                clock_t td = clock();
+                	faces = (*detector)(image);
+	                cout << "Only detection: " << (double) (clock() - td) * 1000/ CLOCKS_PER_SEC << endl;
+                }
+                else
+                {
+                	ocvRects.clear();
+                	ocvDetect(ocvCascade, frame, ocvRects, SCALE_FACTOR);
+                	for (int i = 0; i < ocvRects.size(); i++)
+                	{
+                		faces.push_back(rectangle(ocvRects[i].x, ocvRects[i].y, ocvRects[i].x + ocvRects[i].width, ocvRects[i].y + ocvRects[i].height));
+                	}
+                }
             }
-            else
+            else // track
             {
-            	ocvRects.clear();
-            	ocvDetect(ocvCascade, frame, ocvRects, SCALE_FACTOR);
-            	for (int i = 0; i < ocvRects.size(); i++)
-            	{
-            		faces.push_back(rectangle(ocvRects[i].x, ocvRects[i].y, ocvRects[i].x + ocvRects[i].width, ocvRects[i].y + ocvRects[i].height));
-            	}
+                x = kf->get_current_state();
+                cout << "Current tracking result: " << x(0, 0) << ", " << x(0, 1) << endl;
+                if (facesA.size() > 0)
+                {
+                    faces.push_back(centered_rect(x(0, 0), x(0, 1), facesA[0].width(), facesA[0].height()));                
+                }
+                else
+                {
+                    faces.push_back(centered_rect(x(0, 0), x(0, 1), 75, 75));
+                }  
             }
+            
+            facesA.clear();
+
             // Find the pose of each face.
             for (unsigned long i = 0; i < faces.size(); ++i) {
                 full_object_detection shape = (*estimator)(image, faces[i]);
     		
-		std::vector<cv::Point> landmarks;
-    		for (int i = LANDMARK_START; i < LANDMARK_END; ++i)
-    		{
-        	    landmarks.push_back(cv::Point(shape.part(i).x(), shape.part(i).y()));
-    		};
+		        std::vector<cv::Point> landmarks;
+        		for (int j = LANDMARK_START; j < LANDMARK_END; ++j)
+        		{
+            	    landmarks.push_back(cv::Point(shape.part(j).x(), shape.part(j).y()));
+        		};
 		
                 FacialInfo facialInfo(frame, landmarks);
                 monitorQueue.add(facialInfo);
+                facesA.push_back(faceFromAlignment(shape, image.nr(), image.nc()));
             }
+            
+    		if (facesA.size() > 0)
+    		{
+    		    cout << "Input for tracking update: " << (double)facesA[0].left() + 0.5 * facesA[0].width() << ", " << (double)facesA[0].top() + 0.5 * facesA[0].height() << endl;
+    			z = (double)facesA[0].left() + 0.5 * facesA[0].width(), (double)facesA[0].top() + 0.5 * facesA[0].height();
+    			kf->update(z);
+    		}
+    		else
+    		{
+    			kf->update();
+    		}
+        	ind++;        	
         }
     }
-
+    
+    rectangle faceFromAlignment(full_object_detection shape, int nr, int nc)
+    {
+        double cenX = 0;
+        double cenY = 0;
+        double length = 0;
+        rectangle face;
+        cenX = (shape.part(8).x() + shape.part(57).x() + shape.part(19).x()+ shape.part(24).x()) / 4.0;
+        cenY = (shape.part(8).y() + shape.part(57).y() + shape.part(19).y()+ shape.part(24).y()) / 4.0;
+        length = 0.75 * exactDistance(cv::Point((shape.part(8).x() + shape.part(57).x()) / 2.0, (shape.part(8).y() + shape.part(57).y()) / 2.0), 
+            cv::Point((shape.part(19).x()+ shape.part(24).x()) / 2.0, (shape.part(19).y()+ shape.part(24).y()) / 2.0));
+        face.set_top(cenY - length >= 1 ? cenY - length : 1);
+        face.set_left(cenX - length >= 1 ? cenX - length : 1);
+        face.set_right(cenX + length < nc ? cenX + length : nc);
+        face.set_bottom(cenY + length < nr ? cenY + length : nr);
+        return face;
+    }
+    
     void displayMetrics() {
         // Monitor:
         image_window win;
@@ -477,17 +538,17 @@ int main()
   	// Read the file. If there is an error, report it and exit.
   	try
   	{
-    	    cfg.readFile("application.cfg");
+	    cfg.readFile("application.cfg");
   	}
   	catch(const FileIOException &fioex)
   	{
-    	    cerr << "[CfgParser]: I/O error while reading application.cfg" << endl;
-            exit(1);
+	    cerr << "[CfgParser]: I/O error while reading application.cfg" << endl;
+        exit(1);
   	}
   	catch(const ParseException &pex)
   	{
-    	    cerr << "[CfgParser]: Parse error at " << pex.getFile() << ":" << pex.getLine() << " - " << pex.getError() << endl;
-            exit(1);
+	    cerr << "[CfgParser]: Parse error at " << pex.getFile() << ":" << pex.getLine() << " - " << pex.getError() << endl;
+        exit(1);
   	}
 		
 	const Setting &config = cfg.getRoot();
@@ -496,27 +557,27 @@ int main()
 	int videoId, skipFrames;
 	int apiId; //tl
 	double downScale; //tl
-        if(
-  	    !(
-	        video.lookupValue("id", videoId) && 
-	        video.lookupValue("api", apiId) && //tl
-                video.lookupValue("skipFrames", skipFrames) && 
-                video.lookupValue("downScale", downScale)
-            )
+    if(
+    !(
+        video.lookupValue("id", videoId) && 
+        video.lookupValue("api", apiId) && //tl
+        video.lookupValue("skipFrames", skipFrames) && 
+        video.lookupValue("downScale", downScale)
+        )
 	)
-    	    cerr << "[CfgParser]: Parse video stream config failed." << endl;
+	    cerr << "[CfgParser]: Parse video stream config failed." << endl;
         // Blink detector:
 	const Setting &blinkDetector = config["config"]["blink"];
 	int lag;
 	double varSigmaThresh, dampingFactor;
-        if(
-  	    !(
-	        blinkDetector.lookupValue("lag", lag) && 
-                blinkDetector.lookupValue("varSigmaThresh", varSigmaThresh) && 
-                blinkDetector.lookupValue("dampingFactor", dampingFactor)
-            )
+    if(
+    !(
+        blinkDetector.lookupValue("lag", lag) && 
+            blinkDetector.lookupValue("varSigmaThresh", varSigmaThresh) && 
+            blinkDetector.lookupValue("dampingFactor", dampingFactor)
+        )
 	)
-    	    cerr << "[CfgParser]: Parse video stream config failed." << endl;
+        cerr << "[CfgParser]: Parse video stream config failed." << endl;
 	const Setting &ocvFD = config["config"]["cascade"];
 	string cascadeName;
 	double scaleFactor;
@@ -524,18 +585,32 @@ int main()
 	{
 		cerr << "[CfgParser]: Parse cascade opencv failed." << endl;
 	}
+	
+	const Setting &kalman = config["config"]["track"];
+	int interval = 0;
+	double Qq = 1e-5;
+	double Rr = 1e-3;
+	kalman_filter<4,  2> kf;
+	kf_init kfi= kf_init(&kf, Qq, Rr);
+	kf = *kfi.get_kf();
+	
+	if ( !(kalman.lookupValue("interval", interval) && kalman.lookupValue("q", Qq) && kalman.lookupValue("r", Rr) ) )
+	{
+        cerr << "[CfgParser]: Parse tracking parameters not loaded." << endl;
+	}
 	// Initialize face detector:
-        frontal_face_detector detector = get_frontal_face_detector();
-        // Initialize facial landmark estimator:
-        shape_predictor estimator;
-        deserialize("shape_predictor_68_face_landmarks.dat") >> estimator;
+    frontal_face_detector detector = get_frontal_face_detector();
+    // Initialize facial landmark estimator:
+    shape_predictor estimator;
+    deserialize("shape_predictor_68_face_landmarks.dat") >> estimator;
 
 	// Start driver analyzer:
 	DriverAnalyzer driverAnalyzer(
 	    videoId, apiId, cascadeName, scaleFactor, skipFrames, downScale,
-	    lag, (float)varSigmaThresh, (float)dampingFactor,
+	    lag, (float)varSigmaThresh, (float)dampingFactor, interval,
             &detector,
-            &estimator
+            &estimator,
+            &kf
 	);
 	
 	driverAnalyzer.wait();
